@@ -1,0 +1,11 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+sqlalchemy==2.0.40
+pydantic==2.11.3
+pydantic-settings==2.8.1
+openpyxl==3.1.5
+requests==2.32.3
+# Security — certificate pinning / TLS verification is handled by requests (certifi)
+certifi==2025.1.31
+pytest==8.3.5
+httpx==0.28.1

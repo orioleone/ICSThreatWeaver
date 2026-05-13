@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ICS ThreatWeaver</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }
+    header { padding: 20px 28px; background: #111827; border-bottom: 1px solid #334155; }
+    main { padding: 24px; display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+    section { background: #1e293b; padding: 16px; border-radius: 10px; box-shadow: 0 4px 18px rgba(0,0,0,0.2); }
+    h1, h2 { margin-top: 0; }
+    button { background: #2563eb; color: white; border: 0; padding: 10px 14px; border-radius: 8px; cursor: pointer; }
+    input, textarea, select { width: 100%; margin: 8px 0 12px; padding: 10px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #e2e8f0; box-sizing: border-box; }
+    pre { white-space: pre-wrap; background: #020617; padding: 12px; border-radius: 8px; min-height: 100px; max-height: 500px; overflow-y: auto; }
+    .small { font-size: 0.9rem; color: #cbd5e1; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>ICS ThreatWeaver</h1>
+    <p class="small">Automated MITRE ATT&CK for ICS mapping for ISA/IEC 62443-3-2 risk assessments.</p>
+  </header>
+  <main>
+    <section>
+      <h2>1. Import MITRE ICS Dataset</h2>
+      <button onclick="importMitre()">Import Latest Dataset</button>
+      <pre id="importResult"></pre>
+    </section>
+
+    <section>
+      <h2>2. Generate Rule-Based Mappings</h2>
+      <button onclick="generateMappings()">Generate Rule-Based Mappings</button>
+      <pre id="mappingBuildResult"></pre>
+    </section>
+
+    <section>
+      <h2>3. Zone + MITRE Asset Selection</h2>
+      <input id="zoneName" placeholder="Zone name e.g. Process Cell A" />
+      <textarea id="zoneDescription" placeholder="Zone description"></textarea>
+      <button onclick="createZone()">Create Zone</button>
+      <select id="zoneSelect" onchange="loadActiveZoneAssets()"></select>
+      <button onclick="deleteZone()" style="background:#dc2626;margin-top:4px;">Delete Selected Zone</button>
+      <select id="mitreAssetSelect" multiple size="10"></select>
+      <div style="display:flex;gap:8px;margin:4px 0;">
+        <button onclick="assignMitreAssets(false)" style="flex:1;">Add Assets to Zone</button>
+        <button onclick="assignMitreAssets(true)" style="flex:1;background:#7c3aed;">Replace Zone Assets</button>
+        <button onclick="clearActiveZone()" style="background:#475569;">Clear Zone</button>
+      </div>
+      <div id="activeZoneBadges" style="margin:8px 0;display:flex;flex-wrap:wrap;gap:6px;"></div>
+      <pre id="zoneSelectionResult" style="max-height:320px;overflow-y:auto;"></pre>
+    </section>
+
+    <section>
+      <h2>4. Mapping Output</h2>
+      <button onclick="loadMappingOutput()">Show Deterministic Mapping Output</button>
+      <pre id="mappingOutputResult"></pre>
+    </section>
+
+    <section>
+      <h2>5. Generate Zone Matrix</h2>
+      <button onclick="generateMatrix()">Generate Zone Matrix</button>
+      <pre id="zoneMatrixResult"></pre>
+    </section>
+
+    <section>
+      <h2>6. Excel Export</h2>
+      <label class="small">Output Filename (without extension)</label>
+      <input id="outputFilename" placeholder="e.g. ICS_Risk_Assessment_Zone1" value="ICS_Risk_Assessment" />
+      <label class="small">Template (optional)</label>
+      <div style="display:flex;gap:8px;align-items:center;margin:8px 0 4px;">
+        <input id="templatePath" placeholder="No template selected — uses built-in default" style="flex:1;margin:0;" readonly />
+        <button onclick="triggerFilePicker()" style="white-space:nowrap;">Browse…</button>
+        <button onclick="clearTemplate()" style="background:#64748b;white-space:nowrap;">Clear</button>
+      </div>
+      <input type="file" id="templateFileInput" accept=".xlsx,.xlsm" style="display:none" onchange="handleTemplateFile(this)" />
+      <button onclick="downloadWorkbook()">Download Populated Workbook</button>
+      <pre id="exportResult"></pre>
+    </section>
+  </main>
+
+  <script>
+    async function callApi(path, options = {}) {
+      const response = await fetch(path, {
+        headers: { 'Content-Type': 'application/json' },
+        ...options,
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(JSON.stringify(data));
+      return data;
+    }
+
+    function formatImportResult(data) {
+      return [
+        `Dataset version loaded: ${data.version_tag}`,
+        `Techniques imported:   ${data.technique_count}`,
+        `Mitigations imported:  ${data.mitigation_count}`,
+        `Tactics imported:      ${data.tactic_count}`,
+        `Assets imported:       ${data.asset_count}`,
+        `STIX technique-asset links stored: ${data.stix_asset_links ?? 0}`,
+        `New techniques detected:      ${data.new_techniques.length}`,
+        `Modified techniques detected: ${data.modified_techniques.length}`,
+      ].join('\n');
+    }
+
+    function formatMappingSummary(data) {
+      return [
+        `Version: ${data.version_tag}`,
+        `Technique coverage: ${data.coverage_summary.mapped_techniques}/${data.coverage_summary.technique_count}`,
+        `Asset-technique links created: ${data.coverage_summary.created_links ?? 0}`,
+        `Duplicate links skipped: ${data.deduplication.duplicate_assets_removed}`,
+      ].join('\n');
+    }
+
+    function formatDetailedMappings(data) {
+      // Group by asset → list techniques under each asset
+      const assetMap = {};
+      for (const item of data.mappings) {
+        for (const asset of (item.mapped_asset_details || [])) {
+          const key = `${asset.external_id} ${asset.name}`;
+          if (!assetMap[key]) assetMap[key] = [];
+          assetMap[key].push(`- ${item.technique_id}  ${item.technique_name}`);
+        }
+      }
+      const sorted = Object.keys(assetMap).sort();
+      if (sorted.length === 0) return 'No mappings found.';
+      return sorted.map(assetKey => {
+        const techniques = assetMap[assetKey].join('\n');
+        return `Asset: ${assetKey}\n\nMapped Techniques:\n${techniques}`;
+      }).join('\n\n------------------------------\n\n');
+    }
+
+    async function importMitre() {
+      const data = await callApi('/api/mitre/import', { method: 'POST', body: JSON.stringify({}) });
+      document.getElementById('importResult').textContent = formatImportResult(data);
+      await loadMitreAssets();
+    }
+
+    async function generateMappings() {
+      const data = await callApi('/api/mappings/auto-generate', { method: 'POST' });
+      document.getElementById('mappingBuildResult').textContent = formatMappingSummary(data);
+    }
+
+    async function loadMitreAssets() {
+      const data = await callApi('/api/assets/mitre');
+      const select = document.getElementById('mitreAssetSelect');
+      select.innerHTML = '';
+      for (const asset of data) {
+        const option = document.createElement('option');
+        option.value = asset.external_id;
+        option.textContent = asset.label;
+        option.title = asset.description || '';
+        select.appendChild(option);
+      }
+    }
+
+    async function loadActiveZoneAssets() {
+      const zoneId = document.getElementById('zoneSelect').value;
+      const select = document.getElementById('mitreAssetSelect');
+      for (const option of select.options) {
+        option.selected = false;
+      }
+      if (!zoneId) {
+        return;
+      }
+      const data = await callApi(`/api/zones/${zoneId}/assets`);
+      const selectedAssets = new Set((data.assets || []).map(asset => asset.external_id));
+      for (const option of select.options) {
+        option.selected = selectedAssets.has(option.value);
+      }
+    }
+
+    // Keep one output structure per active zone; re-render updates when assets change.
+    const zoneSelectionSnapshots = new Map();
+
+    function renderZoneSelectionSnapshots() {
+      const pre = document.getElementById('zoneSelectionResult');
+      const blocks = [];
+      for (const [zoneId] of activeZones) {
+        const snapshot = zoneSelectionSnapshots.get(zoneId);
+        if (snapshot) {
+          blocks.push(JSON.stringify(snapshot, null, 2));
+        }
+      }
+      pre.textContent = blocks.join('\n\n');
+      pre.scrollTop = pre.scrollHeight;
+    }
+
+    async function refreshZoneSelectionSnapshot(zoneId) {
+      const data = await callApi(`/api/zones/${zoneId}/assets`);
+      const selectedAssets = [...(data.assets || [])].sort((a, b) => {
+        const extA = a.external_id || '';
+        const extB = b.external_id || '';
+        if (extA !== extB) return extA.localeCompare(extB);
+        return (a.name || '').localeCompare(b.name || '');
+      });
+      zoneSelectionSnapshots.set(String(zoneId), {
+        message: 'MITRE assets assigned',
+        zone: data.zone,
+        selected_assets: selectedAssets,
+      });
+      renderZoneSelectionSnapshots();
+    }
+
+    async function loadZones() {
+      const zones = await callApi('/api/zones');
+      const zoneSelect = document.getElementById('zoneSelect');
+      const previousActiveZoneId = zoneSelect.value;
+
+      zoneSelect.innerHTML = '';
+      for (const zone of zones) {
+        const option = document.createElement('option');
+        option.value = zone.id;
+        option.textContent = `${zone.id} - ${zone.name}`;
+        zoneSelect.appendChild(option);
+      }
+
+      if (previousActiveZoneId && [...zoneSelect.options].some(option => option.value === previousActiveZoneId)) {
+        zoneSelect.value = previousActiveZoneId;
+      } else if (zoneSelect.options.length > 0) {
+        zoneSelect.selectedIndex = 0;
+      }
+
+      await loadActiveZoneAssets();
+    }
+
+    async function createZone() {
+      const payload = {
+        name: document.getElementById('zoneName').value,
+        description: document.getElementById('zoneDescription').value,
+      };
+      const data = await callApi('/api/zones', { method: 'POST', body: JSON.stringify(payload) });
+      await loadZones();
+      document.getElementById('zoneSelect').value = String(data.id);
+      await loadActiveZoneAssets();
+    }
+
+    async function deleteZone() {
+      const zoneId = document.getElementById('zoneSelect').value;
+      if (!zoneId) { document.getElementById('zoneSelectionResult').textContent = 'No zone selected.'; return; }
+      await callApi(`/api/zones/${zoneId}`, { method: 'DELETE' });
+      activeZones.delete(String(zoneId));
+      zoneSelectionSnapshots.delete(String(zoneId));
+      await loadZones();
+      renderActiveZoneBadges();
+      renderZoneSelectionSnapshots();
+    }
+
+    // activeZones tracks zones that have been configured in this session:
+    // Map<zoneId(string), zoneName(string)>
+    const activeZones = new Map();
+
+    async function assignMitreAssets(replaceExisting = false) {
+      const zoneId = document.getElementById('zoneSelect').value;
+      if (!zoneId) { document.getElementById('zoneSelectionResult').textContent = 'Select a zone first.'; return; }
+      const selectedAssets = [...document.getElementById('mitreAssetSelect').selectedOptions].map(o => o.value);
+      if (!selectedAssets.length) { document.getElementById('zoneSelectionResult').textContent = 'Select at least one asset.'; return; }
+      try {
+        await callApi(`/api/zones/${zoneId}/mitre-assets`, {
+          method: 'POST',
+          body: JSON.stringify({ mitre_asset_ids: selectedAssets, replace_existing: replaceExisting }),
+        });
+        // Track this zone as active
+        const zoneName = document.getElementById('zoneSelect').selectedOptions[0].textContent;
+        activeZones.set(zoneId, zoneName);
+        await loadActiveZoneAssets();
+        await refreshZoneSelectionSnapshot(zoneId);
+        renderActiveZoneBadges();
+      } catch (err) {
+        document.getElementById('zoneSelectionResult').textContent = `Error: ${err.message}`;
+      }
+    }
+
+    async function clearActiveZone() {
+      const zoneId = document.getElementById('zoneSelect').value;
+      if (!zoneId) { document.getElementById('zoneSelectionResult').textContent = 'Select a zone first.'; return; }
+      activeZones.delete(zoneId);
+      zoneSelectionSnapshots.delete(String(zoneId));
+      const select = document.getElementById('mitreAssetSelect');
+      for (const option of select.options) {
+        option.selected = false;
+      }
+      renderActiveZoneBadges();
+      renderZoneSelectionSnapshots();
+    }
+
+    async function renderAllActiveZoneAssignments() {
+      if (activeZones.size === 0) {
+        document.getElementById('zoneSelectionResult').textContent = 'No active zone assignments yet.';
+        return;
+      }
+      const blocks = [];
+      for (const [zoneId] of activeZones) {
+        try {
+          const data = await callApi(`/api/zones/${zoneId}/assets`);
+          if (data.assets && data.assets.length > 0) {
+            blocks.push(JSON.stringify({
+              message: 'MITRE assets assigned',
+              zone: data.zone,
+              selected_assets: data.assets,
+            }, null, 2));
+          }
+        } catch (_) { /* zone may have been deleted */ }
+      }
+      document.getElementById('zoneSelectionResult').textContent =
+        blocks.length > 0 ? blocks.join('\n\n') : 'Active zones have no assigned assets.';
+    }
+
+    function renderActiveZoneBadges() {
+      const container = document.getElementById('activeZoneBadges');
+      container.innerHTML = '';
+      for (const [zoneId, zoneName] of activeZones) {
+        const badge = document.createElement('span');
+        badge.style.cssText = 'background:#1d4ed8;padding:4px 10px;border-radius:12px;font-size:0.85rem;cursor:pointer;';
+        badge.title = 'Click to select this zone';
+        badge.textContent = zoneName.replace(/^\d+ - /, '').trim();
+        badge.onclick = () => {
+          document.getElementById('zoneSelect').value = zoneId;
+          loadActiveZoneAssets();
+        };
+        container.appendChild(badge);
+      }
+    }
+
+    async function loadMappingOutput() {
+      const data = await callApi('/api/mappings/report');
+      document.getElementById('mappingOutputResult').textContent = formatDetailedMappings(data);
+    }
+
+    async function generateMatrix() {
+      const activeIds = [...activeZones.keys()];
+      if (activeIds.length === 0) {
+        // Fall back to currently selected zone
+        const zoneId = document.getElementById('zoneSelect').value;
+        if (!zoneId) { document.getElementById('zoneMatrixResult').textContent = 'Assign assets to a zone first.'; return; }
+        const data = await callApi(`/api/zones/${zoneId}/matrix`);
+        document.getElementById('zoneMatrixResult').textContent = JSON.stringify(data, null, 2);
+        return;
+      }
+      // Use combined multi-zone endpoint
+      const data = await callApi('/api/matrix/combined', {
+        method: 'POST',
+        body: JSON.stringify({ zone_ids: activeIds.map(Number) }),
+      });
+      document.getElementById('zoneMatrixResult').textContent = JSON.stringify(data, null, 2);
+    }
+
+    let _serverTemplatePath = '';
+
+    function triggerFilePicker() {
+      document.getElementById('templateFileInput').value = '';
+      document.getElementById('templateFileInput').click();
+    }
+
+    async function handleTemplateFile(input) {
+      const file = input.files[0];
+      if (!file) return;
+      document.getElementById('templatePath').value = `Uploading ${file.name}…`;
+      document.getElementById('exportResult').textContent = '';
+      const form = new FormData();
+      form.append('file', file);
+      try {
+        const response = await fetch('/api/templates/upload', { method: 'POST', body: form });
+        const data = await response.json();
+        if (!response.ok) throw new Error(JSON.stringify(data));
+        _serverTemplatePath = data.server_path;
+        document.getElementById('templatePath').value = file.name;
+      } catch (err) {
+        _serverTemplatePath = '';
+        document.getElementById('templatePath').value = '';
+        document.getElementById('exportResult').textContent = `Template upload failed: ${err.message}`;
+      }
+    }
+
+    function clearTemplate() {
+      _serverTemplatePath = '';
+      document.getElementById('templatePath').value = '';
+      document.getElementById('templateFileInput').value = '';
+    }
+
+    async function downloadWorkbook() {
+      const activeIds = [...activeZones.keys()];
+      const filename = (document.getElementById('outputFilename').value.trim() || 'ICS_Risk_Assessment') + '.xlsx';
+      document.getElementById('exportResult').textContent = 'Generating…';
+      try {
+        let apiPath, payload;
+        if (activeIds.length > 1) {
+          // Multi-zone export
+          apiPath = '/api/export/excel/download/multi';
+          payload = {
+            zone_ids: activeIds.map(Number),
+            template_path: _serverTemplatePath,
+            output_filename: filename,
+            sheet_name: 'Worksheet',
+            start_cell: 'A4',
+          };
+        } else {
+          // Single zone (active or dropdown selection)
+          const zoneId = activeIds.length === 1 ? activeIds[0] : document.getElementById('zoneSelect').value;
+          if (!zoneId) { document.getElementById('exportResult').textContent = 'Select a zone first.'; return; }
+          apiPath = '/api/export/excel/download';
+          payload = {
+            zone_id: Number(zoneId),
+            template_path: _serverTemplatePath,
+            output_filename: filename,
+            sheet_name: 'Worksheet',
+            start_cell: 'A4',
+          };
+        }
+        const response = await fetch(apiPath, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!response.ok) {
+          const err = await response.json();
+          throw new Error(JSON.stringify(err));
+        }
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.click();
+        URL.revokeObjectURL(url);
+        const zoneLabel = activeIds.length > 1 ? `${activeIds.length} zones` : '1 zone';
+        document.getElementById('exportResult').textContent = `Download started: ${filename} (${zoneLabel})`;
+      } catch (err) {
+        document.getElementById('exportResult').textContent = `Error: ${err.message}`;
+      }
+    }
+
+    async function exportWorkbook() {
+      const zoneId = document.getElementById('zoneSelect').value;
+      const payload = {
+        zone_id: Number(zoneId),
+        template_path: _serverTemplatePath,
+        output_path: document.getElementById('outputFilename').value,
+        sheet_name: 'Worksheet',
+        start_cell: 'A4',
+      };
+      const data = await callApi('/api/export/excel', { method: 'POST', body: JSON.stringify(payload) });
+      document.getElementById('exportResult').textContent = JSON.stringify(data, null, 2);
+    }
+
+    window.addEventListener('load', async () => {
+      await loadMitreAssets();
+      await loadZones();
+    });
+  </script>
+</body>
+</html>
